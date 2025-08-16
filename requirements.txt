@@ -1,0 +1,10 @@
+torch
+torchvision
+torchaudio
+sentencepiece
+transformers
+bitsandbytes
+accelerate
+streamlit
+plotly
+pandas
