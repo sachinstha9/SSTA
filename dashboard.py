@@ -1,89 +1,110 @@
-# dashboard.py
-import streamlit as st
+import gradio as gr
 import pandas as pd
 import plotly.express as px
-from get_solar_estimates import get_estimates
-from llm_utils import load_model, generate_explanation, answer_user_question
 import plotly.graph_objects as go
+from geopy.geocoders import Nominatim
+from get_solar_estimates import get_estimates
+from llm_utils import generate_insights, load_model, answer_user_question
 
-st.set_page_config(page_title="Solar Energy Forecast Dashboard", layout="wide")
-st.title("🌞 Solar Energy Forecast Dashboard")
+tokenizer, model, device = load_model()
+geolocator = Nominatim(user_agent="solar_dashboard_app")
 
-st.sidebar.header("Configuration")
+def geocode_location(location_name):
+    try:
+        location = geolocator.geocode(location_name)
+        if location:
+            return location.latitude, location.longitude
+        else:
+            return -36.848461, 174.763336
+    except:
+        return -36.848461, 174.763336
 
-with st.sidebar:
-    location = st.text_input("Location", value="Auckland")
-    forecast_days = st.number_input("Days to forecast (max 7 days)", min_value=1, max_value=7, value=3)
-    panel_area = st.number_input("Panel Area (m2)", min_value=0.0, value=1.0, step=0.1)
-    efficiency = st.number_input("Efficiency (%)", min_value=0, value=17)
-    panel_tilt = st.number_input("Panel Tilt (degree)", min_value=0.0, max_value=90.0, value=45.0, step=0.1)
-    panel_azimuth = st.number_input("Panel Azimuth (degree)", min_value=0.0, max_value=360.0, value=0.0, step=0.1)
+def chatbot_response(summary, user_message, chat_history):
+    if summary is None:
+        return [("Bot", "Dashboard not updated yet. Please update first!")], ""
+    if chat_history is None:
+        chat_history = []
+    chat_history.append(("You", user_message))
+    bot_reply = answer_user_question(summary, user_message, tokenizer, model, device)
+    chat_history.append(("Bot", bot_reply))
+    return chat_history, ""
 
+def update_plots(location, forecast_days, panel_area, efficiency, panel_tilt, panel_azimuth):
+    """Compute plots and avg consumption quickly, without insights."""
+    lat, lon = geocode_location(location)
+    summary = get_estimates(
+        lat, lon, "055867f3ef224c1a80c73746251608", forecast_days,
+        panel_area, efficiency/100,
+        [4,3,2,4,5,2,5,3,5,3,4,3,2,4,5,6,2,4,5,6],
+        panel_tilt, panel_azimuth
+    )
 
-summary_for_llm = get_estimates(-36.848461, 174.763336, "055867f3ef224c1a80c73746251608", 2, 5, 0.15, [4,3,2,4,5,2,5,3,5,3,4,3,2,4,5,6,2,4,5,6], 45, 0)
+    # Hourly predictions
+    predictions = {f"Day {i+1}": e["hourly_predicted_kwh"] for i, e in enumerate(summary["daily_forecast_summary"])}
+    hours = list(range(24))
+    fig_hourly = go.Figure()
+    for day, values in predictions.items():
+        fig_hourly.add_trace(go.Scatter(x=hours, y=values, mode='lines+markers', name=day, line=dict(width=2)))
+    fig_hourly.update_layout(title="Hourly Predicted Solar Energy (Multiple Days)", xaxis_title="Hour", yaxis_title="Energy (kWh)", template="plotly_white")
 
-df = pd.DataFrame({
-    "Hour": list(range(24)),
-    "Predicted kWh": summary_for_llm["daily_forecast_summary"][0]["hourly_predicted_kwh"]
-})
+    # Daily totals
+    daily_totals = {f"Day {i+1}": e["predicted_total_kwh"] for i, e in enumerate(summary["daily_forecast_summary"])}
+    df_totals = pd.DataFrame({"Day": list(daily_totals.keys()), "Total kWh": list(daily_totals.values())})
+    fig_daily = px.bar(df_totals, x="Day", y="Total kWh", title="Total Daily Energy Prediction")
+    avg_consumption = summary.get("daily_average_consumption", 0)
 
-predictions = {}
-for i, e in enumerate(summary_for_llm["daily_forecast_summary"]):
-    predictions["Day " + str(i + 1)] = e["hourly_predicted_kwh"]
+    return fig_hourly, fig_daily, avg_consumption, summary
 
-hours = list(range(24))
-fig = go.Figure()
+def generate_insights_async(summary):
+    """Compute LLM insights separately."""
+    return generate_insights(summary, tokenizer, model, device)
 
-for day, values in predictions.items():
-    fig.add_trace(go.Scatter(
-        x=hours,
-        y=values,
-        mode='lines+markers',
-        name=day,
-        line=dict(width=2),
-        hoverinfo='name+x+y',  
-        opacity=0.8 
-    ))
+# Gradio UI
+with gr.Blocks() as demo:
+    gr.Markdown("## 🌞 Solar Energy Forecast Dashboard")
 
-for trace in fig.data:
-    trace.hoverlabel = dict(bgcolor="yellow", font_size=14, font_family="Arial")
+    with gr.Row():
+        with gr.Column(scale=3):
+            location_input = gr.Textbox(label="Location", value="Auckland")
+            forecast_days_input = gr.Slider(1, 7, value=3, step=1, label="Days to forecast")
+            panel_area_input = gr.Number(value=1.0, label="Panel Area (m2)")
+            efficiency_input = gr.Number(value=17, label="Efficiency (%)")
+            panel_tilt_input = gr.Number(value=45.0, label="Panel Tilt (degree)")
+            panel_azimuth_input = gr.Number(value=0.0, label="Panel Azimuth (degree)")
+            
+            update_btn = gr.Button("Update Dashboard")
 
-# Layout
-fig.update_layout(
-    title="Hourly Predicted Solar Energy (Multiple Days)",
-    xaxis_title="Hour",
-    yaxis_title="Energy (kWh)",
-    xaxis=dict(tickmode='linear'),
-    hovermode="x unified", 
-    template="plotly_white"
-)
-fig.update_layout(title=dict(
-    text="Hourly Predicted Solar Energy (Multiple Days)", 
-    font=dict(size=20)                    
-))
+        with gr.Column(scale=5):
+            hourly_plot = gr.Plot(label="Hourly Predicted Solar Energy")
+            daily_plot = gr.Plot(label="Total Daily Energy Prediction")
+            avg_metric = gr.Number(label="Average of past 7 days")
+            insights_box = gr.Textbox(label="Forecast Insights", interactive=False)
+            summary_state = gr.State()  # store summary for chatbot
 
-col1, col2 = st.columns([5, 2],  gap="large")
+    # Step 1: Update plots immediately
+    def update_dashboard_fast(location, forecast_days, panel_area, efficiency, panel_tilt, panel_azimuth):
+        fig_h, fig_d, avg, summary = update_plots(location, forecast_days, panel_area, efficiency, panel_tilt, panel_azimuth)
+        return fig_h, fig_d, avg, "", summary  # empty insights initially
 
-with col1:
-    st.plotly_chart(fig, use_container_width=True)
+    update_btn.click(
+        update_dashboard_fast,
+        inputs=[location_input, forecast_days_input, panel_area_input, efficiency_input, panel_tilt_input, panel_azimuth_input],
+        outputs=[hourly_plot, daily_plot, avg_metric, insights_box, summary_state]
+    )
 
+    # Step 2: Update insights asynchronously
+    def load_insights(summary):
+        if summary is None:
+            return "No summary available."
+        return generate_insights_async(summary)
 
-daily_totals = {}
-for i, e in enumerate(summary_for_llm["daily_forecast_summary"]):
-    daily_totals["Day " + str(i + 1)] = e["predicted_total_kwh"]
-df = pd.DataFrame({
-    "Day": list(daily_totals.keys()),
-    "Total kWh": list(daily_totals.values())
-})
-fig = px.bar(df, x="Day", y="Total kWh", title="Total Daily Energy Prediction")
-fig.update_traces(marker_line_width=0, marker_line_color="black", width=0.3)  
-fig.update_layout(height=400)
-fig.update_yaxes(dtick=0.2)
-fig.update_layout(title=dict(
-    text="Total Daily Energy Prediction", 
-    font=dict(size=20)                    
-))
+    summary_state.change(load_insights, inputs=[summary_state], outputs=[insights_box])
 
-with col2:
-    st.metric(label="Average of past 7 days", value=f"{summary_for_llm["daily_average_consumption"]} kWh")
-    st.plotly_chart(fig, use_container_width=True)
+    # Chatbot
+    # Chatbot UI
+    gr.Markdown("## Chatbot")
+    chatbot = gr.Chatbot(label="Chatbot")
+    msg = gr.Textbox(label="Type your message")
+    msg.submit(chatbot_response, inputs=[summary_state, msg, chatbot], outputs=[chatbot, msg])
+
+demo.launch(share=True)

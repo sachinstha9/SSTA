@@ -54,6 +54,32 @@ Use cloud cover, precipitation, and low/high generation hours to justify.
     explanation = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     return explanation
 
+def generate_insights(summary_for_llm, tokenizer, model, device, max_tokens=500):
+    insights = {}
+    for i, e in enumerate(summary_for_llm["daily_forecast_summary"]):
+        prompt = f"""
+The following is a solar forecast summary and user consumption data:
+{json.dumps(e, indent=2)}
+
+generate a insight for this data, make it short not more than 7 words
+1. Why solar generation may be insufficient on certain days.
+2. Why solar generation may be sufficient or high on certain days.
+Use cloud cover, precipitation, and low/high generation hours to justify.
+"""
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.9
+            )
+        text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        insights["Day " + str(i + 1)] = text
+    return insights
+
 def answer_user_question(summary_for_llm, question, tokenizer, model, device, max_tokens=200):
     chat_prompt = f"""
 Solar forecast summary: {json.dumps(summary_for_llm, indent=2)}
